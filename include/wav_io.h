@@ -31,15 +31,19 @@ struct AudioData {
     int num_samples;
 };
 
-class AudioData {
-
-public:
-    static bool ReadWavFile(const std::string& filename, AudioData* audio_data);
-    static bool WriteWavFile(const std::string& filename, const AudioData& audio_data);
-
-private:
-    static void ConvertToFloat(const std::vector<uint8_t>& raw_data, std::vector<float>* float_data, int bits_per_sample);
-    static void ConvertFromFloat(const std::vector<float>& float_data, std::vector<uint8_t>* raw_data, int bits_per_sample);
+class WavIO {
+ public:
+  static bool ReadWavFile(const std::string& filename, AudioData* audio_data);
+  static bool WriteWavFile(const std::string& filename, 
+                          const AudioData& audio_data);
+  
+ private:
+  static void ConvertToFloat(const std::vector<uint8_t>& raw_data,
+                           std::vector<float>* float_data,
+                           int bits_per_sample);
+  static void ConvertFromFloat(const std::vector<float>& float_data,
+                             std::vector<uint8_t>* raw_data,
+                             int bits_per_sample);
 };
 
 } // namespace EQProcessor

@@ -19,7 +19,7 @@ public:
 private:
     struct GPUMemory {
         float* d_input;
-        float* d_ouput;
+        float* d_output;
         cufftComplex* d_fft_buffer;
         float* d_eq_response;
         size_t allocated_size;

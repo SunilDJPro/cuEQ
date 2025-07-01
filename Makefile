@@ -15,7 +15,7 @@ OBJECTS_CXX = $(SOURCES_CXX:$(SRCDIR)/%.cpp=$(OBJDIR)/%.o)
 OBJECTS_CU = $(SOURCES_CU:$(SRCDIR)/%.cu=$(OBJDIR)/%.o)
 OBJECTS = $(OBJECTS_CXX) $(OBJECTS_CU)
 
-TARGET = $(BINDIR)/cuEQ
+TARGET = $(BINDIR)/cuEQProcessor
 
 .PHONY: all clean
 

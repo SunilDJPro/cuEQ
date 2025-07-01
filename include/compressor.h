@@ -18,7 +18,7 @@ private:
     float threshold_linear_;
     float ratio_;
     float attack_coeff_;
-    float release_coeff;
+    float release_coeff_;
     float envelope_;
     int sample_rate_;
 };
