@@ -45,11 +45,11 @@ constexpr std::array<float, kNumEqBands> kEqGainsDb = {
     0.0f,   // 3150 Hz
     0.0f,   // 4000 Hz 
     0.0f,   // 5000 Hz
-    0.0f,   // 6300 Hz
-    0.0f,   // 8000 Hz
-    1.0f,   // 10000 Hz
-    1.0f,   // 12500 Hz
-    0.5f,   // 16000 Hz
+    -10.0f,   // 6300 Hz
+    -10.0f,   // 8000 Hz
+    -10.0f,   // 10000 Hz
+    -10.0f,   // 12500 Hz
+    -10.5f,   // 16000 Hz
     0.5f    // 20000 Hz
 };
 
