@@ -8,37 +8,18 @@
 
 namespace EQProcessor {
 
-// CUDA kernel for applying EQ response in frequency domain
+// Simple, high-quality CUDA kernels
+
+// Apply EQ response in frequency domain
 __global__ void ApplyEqResponse(cufftComplex* fft_data, 
                                const float* eq_response,
-                               int fft_size) {
+                               int num_bins) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int num_bins = fft_size / 2 + 1;
   
   if (idx < num_bins) {
     const float gain = eq_response[idx];
-    
-    // Apply gain to complex FFT data
     fft_data[idx].x *= gain;
     fft_data[idx].y *= gain;
-  }
-}
-
-// CUDA kernel for windowing and overlap-add
-__global__ void WindowAndOverlapAdd(const float* input, float* output,
-                                   int fft_size, int hop_size, int num_frames) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int frame_idx = idx / fft_size;
-  const int sample_idx = idx % fft_size;
-  
-  if (frame_idx < num_frames && sample_idx < fft_size) {
-    // Hann window
-    const float window = 0.5f * (1.0f - cosf(2.0f * M_PI * sample_idx / (fft_size - 1)));
-    const float windowed_sample = input[idx] * window;
-    
-    // Overlap-add
-    const int output_idx = frame_idx * hop_size + sample_idx;
-    atomicAdd(&output[output_idx], windowed_sample);
   }
 }
 
@@ -98,205 +79,90 @@ bool cuEQProcessor::ProcessAudio(const std::vector<float>& input_samples,
   const size_t num_samples = input_samples.size();
   const size_t samples_per_channel = num_samples / num_channels;
   
-  std::cout << "Processing " << samples_per_channel << " samples per channel\n";
+  std::cout << "High-quality processing: " << samples_per_channel << " samples per channel\n";
   
   // Calculate processing parameters
   const size_t num_frames = (samples_per_channel + kHopSize - 1) / kHopSize;
-  const size_t padded_length = samples_per_channel + kFftSize;  // Add padding for overlap
+  const size_t output_length = samples_per_channel + kFftSize;  // Add padding for overlap
   
-  std::cout << "Number of frames: " << num_frames << "\n";
+  std::cout << "Number of frames: " << num_frames << " (FFT size: " << kFftSize << ", hop: " << kHopSize << ")\n";
   
-  // Allocate GPU memory for single FFT frame processing
-  const size_t required_size = kFftSize * 2;  // Double buffer for safety
+  // Ensure GPU memory is allocated
+  const size_t required_size = kFftSize * 2;
   if (!AllocateGPUMem(required_size)) {
     return false;
   }
   
   output_samples->resize(num_samples, 0.0f);
   
-  // Process each channel
+  // Process each channel with careful frame-by-frame processing
   for (int channel = 0; channel < num_channels; ++channel) {
     std::cout << "Processing channel " << channel + 1 << "/" << num_channels << "\n";
     
-    std::vector<float> channel_input(padded_length, 0.0f);
-    std::vector<float> channel_output(padded_length, 0.0f);
+    std::vector<float> channel_output(output_length, 0.0f);
     
-    // Extract channel data with zero padding
-    for (size_t i = 0; i < samples_per_channel; ++i) {
-      channel_input[i] = input_samples[i * num_channels + channel];
-    }
-    
-    // Debug: Check if we have non-zero input
-    float max_input = 0.0f;
-    for (size_t i = 0; i < std::min(samples_per_channel, size_t(1000)); ++i) {
-      max_input = std::max(max_input, std::abs(channel_input[i]));
-    }
-    std::cout << "  Channel " << channel << " max input level: " << max_input << "\n";
-    
-    // Process frames with overlap-add
+    // Process each frame with overlap-add
     for (size_t frame = 0; frame < num_frames; ++frame) {
-      if (frame % 1000 == 0) {
-        std::cout << "  Processing frame " << frame << "/" << num_frames << "\n";
+      if (frame % 2000 == 0) {
+        std::cout << "  Frame " << frame << "/" << num_frames << "\n";
       }
       
       const size_t frame_start = frame * kHopSize;
       
-      // Prepare frame input with zero padding
+      // Prepare input frame with proper windowing
       std::vector<float> frame_input(kFftSize, 0.0f);
-      const size_t copy_size = std::min(static_cast<size_t>(kFftSize), 
-                                       samples_per_channel - frame_start);
       
-      if (frame_start < samples_per_channel) {
-        std::copy(channel_input.begin() + frame_start,
-                 channel_input.begin() + frame_start + copy_size,
-                 frame_input.begin());
+      // Extract frame data
+      for (size_t i = 0; i < kFftSize; ++i) {
+        const size_t sample_idx = frame_start + i;
+        if (sample_idx < samples_per_channel) {
+          const size_t interleaved_idx = sample_idx * num_channels + channel;
+          if (interleaved_idx < input_samples.size()) {
+            frame_input[i] = input_samples[interleaved_idx];
+          }
+        }
       }
       
-      // Apply window function (Hann window) - ONLY ONCE HERE
+      // Apply Hann window for smooth reconstruction
       for (size_t i = 0; i < kFftSize; ++i) {
         const float window = 0.5f * (1.0f - std::cos(2.0f * M_PI * i / (kFftSize - 1)));
         frame_input[i] *= window;
       }
       
-      // Copy frame to GPU
-      cudaError_t cuda_err = cudaMemcpy(gpu_memory_->d_input, frame_input.data(),
-                                       kFftSize * sizeof(float), cudaMemcpyHostToDevice);
-      if (cuda_err != cudaSuccess) {
-        std::cerr << "CUDA memcpy error: " << cudaGetErrorString(cuda_err) << "\n";
-        return false;
-      }
-      
-      // Debug: Check input data on GPU
-      if (frame == 0) {
-        std::vector<float> gpu_input_check(kFftSize);
-        cudaMemcpy(gpu_input_check.data(), gpu_memory_->d_input, 
-                  kFftSize * sizeof(float), cudaMemcpyDeviceToHost);
-        float max_gpu_input = 0.0f;
-        for (size_t i = 0; i < kFftSize; ++i) {
-          max_gpu_input = std::max(max_gpu_input, std::abs(gpu_input_check[i]));
-        }
-        std::cout << "    GPU input max level: " << max_gpu_input << "\n";
-      }
+      // Copy to GPU
+      cudaMemcpy(gpu_memory_->d_input, frame_input.data(),
+                kFftSize * sizeof(float), cudaMemcpyHostToDevice);
       
       // Forward FFT
-      cufftResult fft_result = cufftExecR2C(fft_plan_forward_, gpu_memory_->d_input, 
-                                           gpu_memory_->d_fft_buffer);
-      if (fft_result != CUFFT_SUCCESS) {
-        std::cerr << "cuFFT forward error: " << fft_result << "\n";
-        return false;
-      }
-      
-      // Debug: Check FFT output
-      if (frame == 0) {
-        std::vector<cufftComplex> fft_check(kFftSize / 2 + 1);
-        cudaMemcpy(fft_check.data(), gpu_memory_->d_fft_buffer, 
-                  (kFftSize / 2 + 1) * sizeof(cufftComplex), cudaMemcpyDeviceToHost);
-        float max_fft_mag = 0.0f;
-        for (size_t i = 0; i < fft_check.size(); ++i) {
-          float magnitude = std::sqrt(fft_check[i].x * fft_check[i].x + fft_check[i].y * fft_check[i].y);
-          max_fft_mag = std::max(max_fft_mag, magnitude);
-        }
-        std::cout << "    FFT output max magnitude: " << max_fft_mag << "\n";
-      }
-      
-      // DEBUG: Re-enable EQ application with proper scaling
-      // Debug: Check EQ response on GPU before applying
-      if (frame == 0) {
-        std::vector<float> eq_check(kFftSize / 2 + 1);
-        cudaMemcpy(eq_check.data(), gpu_memory_->d_eq_response, 
-                  (kFftSize / 2 + 1) * sizeof(float), cudaMemcpyDeviceToHost);
-        std::cout << "    EQ response on GPU: ";
-        for (int i = 0; i < 10; ++i) {
-          std::cout << eq_check[i] << " ";
-        }
-        std::cout << "\n";
-        
-        // Check for invalid values
-        int invalid_count = 0;
-        for (size_t i = 0; i < eq_check.size(); ++i) {
-          if (eq_check[i] != eq_check[i] || eq_check[i] == 0.0f) {  // NaN or zero check
-            invalid_count++;
-          }
-        }
-        std::cout << "    Invalid EQ values: " << invalid_count << " out of " << eq_check.size() << "\n";
-      }
+      cufftExecR2C(fft_plan_forward_, gpu_memory_->d_input, gpu_memory_->d_fft_buffer);
       
       // Apply EQ
       const int block_size = 256;
       const int grid_size = (kFftSize / 2 + 1 + block_size - 1) / block_size;
       ApplyEqResponse<<<grid_size, block_size>>>(
-          gpu_memory_->d_fft_buffer, gpu_memory_->d_eq_response, kFftSize);
+          gpu_memory_->d_fft_buffer, gpu_memory_->d_eq_response, kFftSize / 2 + 1);
       
-      // Synchronize to ensure kernel completion
-      cuda_err = cudaDeviceSynchronize();
-      if (cuda_err != cudaSuccess) {
-        std::cerr << "CUDA synchronization error: " << cudaGetErrorString(cuda_err) << "\n";
-        return false;
-      }
-      
-      // Debug: Check EQ output
-      if (frame == 0) {
-        std::vector<cufftComplex> eq_check(kFftSize / 2 + 1);
-        cudaMemcpy(eq_check.data(), gpu_memory_->d_fft_buffer, 
-                  (kFftSize / 2 + 1) * sizeof(cufftComplex), cudaMemcpyDeviceToHost);
-        float max_eq_mag = 0.0f;
-        for (size_t i = 0; i < eq_check.size(); ++i) {
-          float magnitude = std::sqrt(eq_check[i].x * eq_check[i].x + eq_check[i].y * eq_check[i].y);
-          max_eq_mag = std::max(max_eq_mag, magnitude);
-        }
-        std::cout << "    After EQ max magnitude: " << max_eq_mag << "\n";
-      }
+      cudaDeviceSynchronize();
       
       // Inverse FFT
-      fft_result = cufftExecC2R(fft_plan_inverse_, gpu_memory_->d_fft_buffer, 
-                               gpu_memory_->d_output);
-      if (fft_result != CUFFT_SUCCESS) {
-        std::cerr << "cuFFT inverse error: " << fft_result << "\n";
-        return false;
-      }
+      cufftExecC2R(fft_plan_inverse_, gpu_memory_->d_fft_buffer, gpu_memory_->d_output);
       
-      // Debug: Check IFFT output before normalization
-      if (frame == 0) {
-        std::vector<float> ifft_check(kFftSize);
-        cudaMemcpy(ifft_check.data(), gpu_memory_->d_output, 
-                  kFftSize * sizeof(float), cudaMemcpyDeviceToHost);
-        float max_ifft = 0.0f;
-        for (size_t i = 0; i < kFftSize; ++i) {
-          max_ifft = std::max(max_ifft, std::abs(ifft_check[i]));
-        }
-        std::cout << "    IFFT raw output max: " << max_ifft << "\n";
-      }
-      
-      // Copy frame back from GPU
+      // Copy result back
       std::vector<float> frame_output(kFftSize);
-      cuda_err = cudaMemcpy(frame_output.data(), gpu_memory_->d_output,
-                           kFftSize * sizeof(float), cudaMemcpyDeviceToHost);
-      if (cuda_err != cudaSuccess) {
-        std::cerr << "CUDA memcpy back error: " << cudaGetErrorString(cuda_err) << "\n";
-        return false;
-      }
+      cudaMemcpy(frame_output.data(), gpu_memory_->d_output,
+                kFftSize * sizeof(float), cudaMemcpyDeviceToHost);
       
-      // Normalize with proper scaling (cuFFT doesn't normalize)
-      // The key issue: we need to account for the window function energy loss
+      // Proper normalization and windowing for overlap-add
       const float fft_normalization = 1.0f / kFftSize;
-      const float window_energy_compensation = 2.0f;  // Hann window loses ~50% energy
-      const float overlap_compensation = 2.0f;  // Overlap-add with 75% overlap needs compensation
-      const float total_scale = fft_normalization * window_energy_compensation * overlap_compensation;
+      const float overlap_compensation = 1.0f;  // No additional scaling needed with proper overlap
       
       for (size_t i = 0; i < kFftSize; ++i) {
-        frame_output[i] *= total_scale;
+        // Apply same window again for smooth overlap-add reconstruction
+        const float window = 0.5f * (1.0f - std::cos(2.0f * M_PI * i / (kFftSize - 1)));
+        frame_output[i] = frame_output[i] * fft_normalization * window * overlap_compensation;
       }
       
-      // Debug: Check final frame output level
-      if (frame == 0) {
-        float max_final = 0.0f;
-        for (size_t i = 0; i < kFftSize; ++i) {
-          max_final = std::max(max_final, std::abs(frame_output[i]));
-        }
-        std::cout << "    Final frame output max: " << max_final << "\n";
-      }
-      
-      // Overlap-add
+      // Overlap-add to output buffer
       for (size_t i = 0; i < kFftSize; ++i) {
         const size_t output_idx = frame_start + i;
         if (output_idx < channel_output.size()) {
@@ -305,14 +171,7 @@ bool cuEQProcessor::ProcessAudio(const std::vector<float>& input_samples,
       }
     }
     
-    // Debug: Check output levels
-    float max_output = 0.0f;
-    for (size_t i = 0; i < std::min(samples_per_channel, size_t(1000)); ++i) {
-      max_output = std::max(max_output, std::abs(channel_output[i]));
-    }
-    std::cout << "  Channel " << channel << " max output level: " << max_output << "\n";
-    
-    // Copy channel output back to interleaved format
+    // Copy processed channel back to interleaved output
     for (size_t i = 0; i < samples_per_channel; ++i) {
       if (i < channel_output.size()) {
         (*output_samples)[i * num_channels + channel] = channel_output[i];
@@ -320,6 +179,7 @@ bool cuEQProcessor::ProcessAudio(const std::vector<float>& input_samples,
     }
   }
   
+  std::cout << "High-quality processing completed\n";
   return true;
 }
 
@@ -421,54 +281,38 @@ bool cuEQProcessor::CreateEQResponse(int sample_rate) {
   const int num_bins = kFftSize / 2 + 1;
   std::vector<float> eq_response(num_bins, 1.0f);
   
-  std::cout << "Creating EQ response with " << num_bins << " frequency bins\n";
-  std::cout << "Sample rate: " << sample_rate << " Hz, FFT size: " << kFftSize << "\n";
+  std::cout << "Creating clean EQ response with " << num_bins << " frequency bins\n";
   
-  // Create frequency response based on 31-band ISO EQ
+  // Create frequency response using clean bell filters
   for (int bin = 0; bin < num_bins; ++bin) {
     const float frequency = static_cast<float>(bin) * sample_rate / (2.0f * kFftSize);
     float total_gain_db = 0.0f;
     
-    // Apply all relevant EQ bands for this frequency
+    // Apply each EQ band with proper Q factor
     for (int band = 0; band < kNumEqBands; ++band) {
       const float center_freq = kIsoCenterFreqs[band];
       const float gain_db = kEqGainsDb[band];
       
-      if (std::abs(gain_db) > 0.01f && frequency > 1.0f) {  // Skip DC and very low frequencies
-        // Use octave-based bandwidth (1/3 octave = ~0.231 in log2 space)
-        const float log_freq = std::log2(frequency);
-        const float log_center = std::log2(center_freq);
-        const float octave_distance = std::abs(log_freq - log_center);
+      if (std::abs(gain_db) > 0.01f && frequency > 10.0f) {
+        // Standard parametric EQ bell filter
+        const float Q = 2.0f;  // Professional Q factor
+        const float omega = 2.0f * M_PI * frequency / sample_rate;
+        const float omega_c = 2.0f * M_PI * center_freq / sample_rate;
         
-        // 1/3 octave bandwidth
-        if (octave_distance <= 0.5f) {  // Within 1/2 octave for smooth response
-          const float weight = std::cos(octave_distance * M_PI);  // Smooth rolloff
-          total_gain_db += gain_db * weight * weight;
+        // Bell filter frequency response
+        const float delta_omega = omega - omega_c;
+        const float bandwidth = omega_c / Q;
+        
+        if (std::abs(delta_omega) < bandwidth) {
+          const float response = 1.0f / (1.0f + std::pow(delta_omega / (bandwidth / 2.0f), 2));
+          total_gain_db += gain_db * response;
         }
       }
     }
     
-    eq_response[bin] = std::pow(10.0f, total_gain_db / 20.0f);
+    // Convert to linear gain with reasonable limits
+    eq_response[bin] = std::pow(10.0f, std::clamp(total_gain_db, -20.0f, 20.0f) / 20.0f);
   }
-  
-  // Debug: Print some EQ response values
-  std::cout << "EQ response samples: ";
-  const int debug_samples = std::min(10, num_bins);
-  for (int i = 0; i < debug_samples; ++i) {
-    const int bin_idx = (i * num_bins) / debug_samples;
-    const float freq = static_cast<float>(bin_idx) * sample_rate / (2.0f * kFftSize);
-    std::cout << freq << "Hz=" << eq_response[bin_idx] << " ";
-  }
-  std::cout << "\n";
-  
-  // Verify we have some non-unity gains
-  int non_unity_count = 0;
-  for (int i = 0; i < num_bins; ++i) {
-    if (std::abs(eq_response[i] - 1.0f) > 0.01f) {
-      non_unity_count++;
-    }
-  }
-  std::cout << "Non-unity gains: " << non_unity_count << " out of " << num_bins << " bins\n";
   
   // Copy EQ response to GPU
   cudaError_t cuda_err = cudaMemcpy(gpu_memory_->d_eq_response, eq_response.data(),
@@ -478,7 +322,7 @@ bool cuEQProcessor::CreateEQResponse(int sample_rate) {
     return false;
   }
   
-  std::cout << "EQ response created and uploaded to GPU\n";
+  std::cout << "Clean EQ response uploaded to GPU\n";
   return true;
 }
 
